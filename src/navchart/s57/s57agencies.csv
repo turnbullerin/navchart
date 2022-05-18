@@ -1,2 +1,4 @@
-Number,Code
-50,CA
+Number,Code,Producer
+50,CA,"Canadian Hydrographic Service (CHS)"
+550,US,"Office of Coast Survey, National Ocean Service, National Oceanic and Atmospheric Administration (NOS)"
+0,1B,"UKHO test and sample datasets"

@@ -68,6 +68,9 @@ class DataStream:
         self.data = data
         self.index = 0
 
+    def __repr__(self):
+        return bytes(self.data).decode("utf-8", errors="replace")
+
     def empty(self):
         return self.index >= len(self.data)
 
@@ -92,7 +95,20 @@ class DataStream:
             if pos is not None:
                 chunk = self.data[self.index:pos]
                 self.index = pos + 1
-        else:
+        elif length == DataStream.TO_FTUT:
+            pos1 = self.seek(DataStream.UT, self.index)
+            pos2 = self.seek(DataStream.FT, self.index)
+            pos = None
+            if pos1 is None:
+                pos = pos2
+            elif pos2 is None:
+                pos = pos1
+            else:
+                pos = min(pos1, pos2)
+            if pos is not None:
+                chunk = self.data[self.index:pos]
+                self.index = pos + 1
+        elif length > 0:
             chunk = self.data[self.index:self.index+length]
             self.index += length
         return chunk
@@ -102,8 +118,8 @@ class DataStream:
         return len(byte_list)
 
     def read_str(self, length, encoding='ascii'):
-        chunk = bytes(self.read(length))
-        return chunk.decode(encoding) if chunk else None
+        chunk = self.read(length)
+        return bytes(chunk).decode(encoding) if chunk else None
 
     def write_str(self, string, encoding='ascii'):
         return self.write(string.encode(encoding))
@@ -116,9 +132,7 @@ class DataStream:
         return self.write_str(self._fix_number(number, length))
 
     def read_decimal(self, length):
-        print(length)
         chunk = self.read_str(length)
-        print(chunk)
         return decimal.Decimal(chunk) if chunk else None
 
     def write_decimal(self, number, length=None):
@@ -218,7 +232,6 @@ class DataFieldDescriptor(FieldDescriptor):
     @staticmethod
     def value_from_stream(format_code, stream):
         read_length = DataFieldDescriptor._interpret_field_length(format_code)
-        print(format_code, read_length)
         if format_code[0] == 'A':
             # TODO: Check how we pull the encoding
             return stream.read_str(read_length, 'latin-1')
@@ -312,7 +325,6 @@ class ArrayDataFieldDescriptor(DataFieldDescriptor):
         return total
 
     def data_from_stream(self, stream):
-        print(self.internal_structure)
         values = []
         while not stream.empty():
             arr = {}
@@ -325,7 +337,10 @@ class ArrayDataFieldDescriptor(DataFieldDescriptor):
             return values[0]
 
     def _descriptor_list(self):
-        return '!'.join([x for x in self.structure_order])
+        lst = '!'.join([x for x in self.structure_order])
+        if self.structure == 2:
+            lst = "*" + lst
+        return lst
 
     def _format_list(self):
         format_codes = []
@@ -372,7 +387,10 @@ class ArrayDataFieldDescriptor(DataFieldDescriptor):
                 format_codes.extend([code for x in range(0, int(count_str))])
         descriptor_list = descriptors.split("!")
         for i in range(0, len(descriptor_list)):
-            f.add_sub_field(descriptor_list[i], format_codes[i])
+            desc = descriptor_list[i]
+            if desc.startswith("*"):
+                desc = desc[1:]
+            f.add_sub_field(desc, format_codes[i])
         return f
 
 
@@ -517,6 +535,21 @@ class Field:
         self.data = None
         self.data_type = None
 
+    def __getitem__(self, item):
+        return self.data[item]
+
+    def __len__(self):
+        return len(self.data)
+
+    def __contains__(self, item):
+        if isinstance(self.data, dict):
+            return item in self.data
+        else:
+            return item < len(self.data)
+
+    def __iter__(self):
+        return iter(self.data)
+
     def from_value(self, d):
         self.data = d
         return self
@@ -648,12 +681,16 @@ class DataFile:
     def __getitem__(self, item):
         return self._records[item]
 
+    def __len__(self):
+        return len(self._records)
+
     @staticmethod
     def from_file(file):
         f = DataFile()
         with open(file, "rb") as h:
             stream = DataStream(list(h.read()))
             f.metadata = Metadata.from_stream(stream)
+
             while not stream.empty():
                 f.add_record(Record.from_stream(f.metadata, stream))
         return f

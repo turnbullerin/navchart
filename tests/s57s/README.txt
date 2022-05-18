@@ -1,0 +1,2 @@
+These files are provided by the US government free-of-charge and for any use from https://nauticalcharts.noaa.gov/charts/noaa-enc.html . They are included here only for ease
+of testing and users should not rely on these products to be up to date in any sense. Please use the link to get the latest charts for navigation.

@@ -1,13 +1,19 @@
 import logging
-import iso8211_scratch
 import copy
 import decimal
 import os
-import functools
 import re
 import datetime
 from pathlib import Path
 from autoinject import injector
+from .iso8211 import DataFile, Record, bytes_to_int
+from functools import lru_cache
+import csv
+
+try:
+    from functools import cached_property
+except ImportError:
+    from backports.cached_property import cached_property
 
 
 @injector.injectable
@@ -18,9 +24,44 @@ class S57Standard:
         self._agency_map = {}
         self._object_type_map = {}
         self._attribute_name_map = {}
+        self._init_flag = False
 
     def init(self):
-        pass
+        if not self._init_flag:
+            self._init_flag = True
+            base = Path(__file__).parent
+            with open(base / "s57recordnames.csv", "r") as h:
+                reader = csv.reader(h)
+                for line in reader:
+                    if line[0] == "Number":
+                        continue
+                    if len(line) < 2:
+                        continue
+                    self._record_name_map[int(line[0])] = line[1]
+            with open(base / "s57agencies.csv", "r") as h:
+                reader = csv.reader(h)
+                for line in reader:
+                    if line[0] == "Number":
+                        continue
+                    if len(line) < 2:
+                        continue
+                    self._agency_map[int(line[0])] = line[1]
+            with open(base / "s57objectclasses.csv", "r") as h:
+                reader = csv.reader(h)
+                for line in reader:
+                    if line[0] == "Code":
+                        continue
+                    if len(line) < 3:
+                        continue
+                    self._object_type_map[int(line[0])] = line[2]
+            with open(base / "s57attributes.csv", "r") as h:
+                reader = csv.reader(h)
+                for line in reader:
+                    if line[0] == "Code":
+                        continue
+                    if len(line) < 3:
+                        continue
+                    self._attribute_name_map[int(line[0])] = line[2]
 
     def attribute_name(self, name_or_num):
         return self._to_str(name_or_num, self._attribute_name_map, "attribute")
@@ -48,7 +89,7 @@ class S57Standard:
 class S57Cell:
 
     def __init__(self, cell_file):
-        if not cell_file.endswith(".000"):
+        if not cell_file.name.endswith(".000"):
             raise ValueError("Invalid cell file")
         self.path = Path(cell_file)
         self.multiplication_factors = None
@@ -70,7 +111,7 @@ class S57Cell:
                 elif file.name.endswith(".000"):
                     return S57Cell(file.path)
 
-    @functools.cached_property
+    @cached_property
     def support_files(self):
         file_set = set()
         for feat in self.features():
@@ -80,7 +121,7 @@ class S57Cell:
                 file_set.add(feat["NTXTDS"])
         return file_set
 
-    @functools.cache
+    @lru_cache(None)
     def support_file_real_path(self, filename):
         search_dirs = [self.path.parent]
         while search_dirs:
@@ -92,7 +133,7 @@ class S57Cell:
                     return file.path
         return None
 
-    @functools.cached_property
+    @cached_property
     def update_no(self, force_load=False):
         if force_load:
             self._load_updates()
@@ -101,7 +142,7 @@ class S57Cell:
         self._set_update_file_count()
         return self.update_file_count
 
-    @functools.cached_property
+    @cached_property
     def edition_no(self, force_load=False):
         if not (self.base_loaded_flag or force_load):
             # Fast grab of the edition, which is usually in the top few kB of the file
@@ -117,12 +158,12 @@ class S57Cell:
         self._load_base_cell()
         return self.metadata["DSID"]["EDTN"]
 
-    @functools.cached_property
+    @cached_property
     def issued_date(self):
         self._load_updates()
         return datetime.datetime.strptime(self.metadata["ISDT"], "%Y%m%d")
 
-    @functools.cached_property
+    @cached_property
     def update_application_date(self):
         self._load_base_cell()
         return datetime.datetime.strptime(self.metadata["UPDT"], "%Y%m%d")
@@ -171,10 +212,10 @@ class S57Cell:
                     *self.multiplication_factors
                 ))
             self.updates_loaded_flag = True
-            for feature in self._features:
-                feature.set_reference_cell(self)
-            for geom in self._geometries:
-                geom.set_reference_cell(self)
+            for f_name in self._features:
+                self._features[f_name].set_reference_cell(self)
+            for g_name in self._geometries:
+                self._geometries[g_name].set_reference_cell(self)
 
     def _apply_update_file(self, update):
         self._features.update(update.features)
@@ -197,13 +238,11 @@ class S57DataFile:
 
     @injector.construct
     def __init__(self, path, coordinate_factor=None, sounding_factor=None):
-        self._raw = iso8211.ISO8211File()
-        self._raw.from_file(path)
+        self._raw = DataFile.from_file(path)
         self.coordinate_factor = None
         self.sounding_factor = None
         self.path = path
         self.is_base_cell = str(path).endswith(".000")
-
         self.geometries = None
         self.features = None
         self.metadata = None
@@ -223,50 +262,50 @@ class S57DataFile:
             self.metadata = {}
             self.feature_deletes = []
             self.geometry_deletes = []
-            for dataset in self._raw.datasets():
-                if "VRID" in dataset:
-                    if dataset["VRID"][0]["RUIN"] == 2:
+            for record in self._raw:
+                if "VRID" in record:
+                    if record["VRID"]["RUIN"] == 2:
                         self.updates.append(
                             S57GeometryUpdate(
                                 self.standard,
                                 self.coordinate_factor,
                                 self.sounding_factor
-                            ).from_iso8211(dataset)
+                            ).from_iso8211(record)
                         )
-                    elif dataset["VRID"][0]["RUIN"] == 1:
+                    elif record["VRID"]["RUIN"] == 1:
                         geometry = S57Geometry(
                             self.standard,
                             self.coordinate_factor,
                             self.sounding_factor
-                        ).from_iso8211(dataset)
+                        ).from_iso8211(record)
                         self.geometries[geometry.identifier] = geometry
-                    elif dataset["VRID"][0]["RUIN"] == 3:
-                        self.geometry_deletes.append(BaseS57Geometry.geometry_identifier(dataset, self.standard))
+                    elif record["VRID"]["RUIN"] == 3:
+                        self.geometry_deletes.append(BaseS57Geometry.geometry_identifier(record, self.standard))
                     else:
-                        raise ValueError("Unrecognized update instruction {}".format(dataset["VRID"][0]["RUIN"]))
-                elif "FOID" in dataset:
-                    if dataset["FOID"][0]["RUIN"] == 2:
-                        self.updates.append(S57FeatureUpdate(self.standard).from_iso8211(dataset))
-                    elif dataset["FOID"][0]["RUIN"] == 1:
-                        feature = S57Feature(self.standard).from_iso8211(dataset)
+                        raise ValueError("Unrecognized update instruction {}".format(record["VRID"][0]["RUIN"]))
+                elif "FRID" in record:
+                    if record["FRID"]["RUIN"] == 2:
+                        self.updates.append(S57FeatureUpdate(self.standard).from_iso8211(record))
+                    elif record["FRID"]["RUIN"] == 1:
+                        feature = S57Feature(self.standard).from_iso8211(record)
                         self.features[feature.identifier] = feature
-                    elif dataset["FOID"][0]["RUIN"] == 3:
-                        self.feature_deletes.append(BaseS57Feature.feature_identifier(dataset, self.standard))
-                elif "DSID" in dataset or "DSPM" in dataset or "DSSI" in dataset:
-                    self._process_metadata_dataset(dataset)
+                    elif record["FRID"]["RUIN"] == 3:
+                        self.feature_deletes.append(BaseS57Feature.feature_identifier(record, self.standard))
+                elif "DSID" in record or "DSPM" in record or "DSSI" in record:
+                    self._process_metadata_dataset(record)
             self.loaded_flag = True
 
-    def _process_metadata_dataset(self, data: iso8211.Record):
+    def _process_metadata_dataset(self, data: Record):
         if "DSID" in data:
-            self.metadata["DSID"] = data["DSID"][0]
+            self.metadata["DSID"] = data["DSID"].data
         if "DSPM" in data:
-            self.metadata["DSPM"] = data["DSPM"][0]
-            if self.coordinate_factor is None and "COMF" in data["DSPM"][0] and data["DSPM"][0]["COMF"]:
-                self.coordinate_factor = data["DSPM"][0]["COMF"]
-            if self.sounding_factor is None and "SOMF" in data["DSPM"][0] and data["DSPM"][0]["SOMF"]:
-                self.sounding_factor = data["DSPM"][0]["SOMF"]
+            self.metadata["DSPM"] = data["DSPM"].data
+            if self.coordinate_factor is None and "COMF" in data["DSPM"] and data["DSPM"]["COMF"]:
+                self.coordinate_factor = data["DSPM"]["COMF"]
+            if self.sounding_factor is None and "SOMF" in data["DSPM"] and data["DSPM"]["SOMF"]:
+                self.sounding_factor = data["DSPM"]["SOMF"]
         if "DSSI" in data:
-            self.metadata["DSSI"] = data["DSSI"][0]
+            self.metadata["DSSI"] = data["DSSI"].data
 
 
 class S57Object:
@@ -285,7 +324,7 @@ class S57Object:
         sref = {
             "NAME": "{}_{}".format(
                 self.standard.record_name(record_set["NAME"][-1]),
-                iso8211.bytes_to_int(record_set["NAME"][:-1])
+                bytes_to_int(record_set["NAME"][:-1])
             ),
             "ORNT": record_set["ORNT"],
             "USAG": record_set["USAG"],
@@ -317,15 +356,15 @@ class BaseS57Feature(S57Object):
     @staticmethod
     def feature_identifier(data, standard: S57Standard):
         return "{}_{}_{}".format(
-            standard.agency(data["FOID"][0]["AGEN"]),
-            data["FOID"][0]["FIDN"],
-            data["FOID"][0]["FIDS"],
+            standard.agency(data["FOID"]["AGEN"]),
+            data["FOID"]["FIDN"],
+            data["FOID"]["FIDS"],
         )
 
-    def from_iso8211(self, data: iso8211.Record):
+    def from_iso8211(self, data: Record):
         self.identifier = BaseS57Feature.feature_identifier(data, self.standard)
-        self.metadata = copy.deepcopy(data["FOID"][0])
-        self.metadata.update(data["FRID"][0])
+        self.metadata = copy.deepcopy(data["FOID"].data)
+        self.metadata.update(data["FRID"].data)
         self.layer = self.standard.object_type(self.metadata["OBJL"])
         if "ATTF" in data:
             for attribute in data["ATTF"]:
@@ -338,9 +377,9 @@ class BaseS57Feature(S57Object):
     def _build_feature_reference(self, record_set):
         return {
             "LNAM": "{}_{}_{}".format(
-                self.standard.agency(iso8211.bytes_to_int(record_set["LNAM"][6:])),
-                iso8211.bytes_to_int(record_set["LNAM"][2:6]),
-                iso8211.bytes_to_int(record_set["LNAM"][0:2])
+                self.standard.agency(bytes_to_int(record_set["LNAM"][6:])),
+                bytes_to_int(record_set["LNAM"][2:6]),
+                bytes_to_int(record_set["LNAM"][0:2])
             ),
             "RIND": record_set["RIND"],
             "COMT": record_set["COMT"]
@@ -359,8 +398,8 @@ class S57Feature(BaseS57Feature):
     def __getitem__(self, item):
         return self.attributes[item]
 
-    def from_iso8211(self, data: iso8211.Record):
-        super().from_iso8211()
+    def from_iso8211(self, data: Record):
+        super().from_iso8211(data)
         if "FFPT" in data:
             for feature_pointer in data["FFPT"]:
                 self.feature_references.append(self._build_feature_reference(feature_pointer))
@@ -369,7 +408,7 @@ class S57Feature(BaseS57Feature):
                 self.spatial_references.append(self._build_spatial_reference(spatial_pointer))
         return self
 
-    @functools.cached_property
+    @cached_property
     def geometry(self):
         if self.metadata["PRIM"] == 255:
             return "NONE", []
@@ -403,7 +442,7 @@ class S57Feature(BaseS57Feature):
             return "POLYGON", [points, *inner_cut]
         raise ValueError("Unknown PRIM {}".format(self.metadata["PRIM"]))
 
-    @functools.cached_property
+    @cached_property
     def wkt(self):
         datatype, point_list = self.geometry
         if datatype == "NONE":
@@ -426,7 +465,7 @@ class S57FeatureUpdate(BaseS57Feature):
         self.spatial_ref_update = None
         self.feature_ref_update = None
 
-    def from_iso8211(self, data: iso8211.Record):
+    def from_iso8211(self, data: Record):
         super().from_iso8211()
         if "FFPC" in data:
             self.feature_ref_update = (data["FFPC"][0], data["FFPT"])
@@ -471,14 +510,14 @@ class BaseS57Geometry(S57Object):
     @staticmethod
     def geometry_identifier(data, standard: S57Standard):
         return "{}_{}".format(
-            standard.record_name(data["VRID"][0]["RCNM"]),
-            data["VRID"][0]["RCID"]
+            standard.record_name(data["VRID"]["RCNM"]),
+            data["VRID"]["RCID"]
         )
 
-    def from_iso8211(self, data: iso8211.Record):
+    def from_iso8211(self, data: Record):
         self.identifier = BaseS57Geometry.geometry_identifier(data, self.standard)
-        self.record_name = self.standard.record_name(data["VRID"][0]["RCNM"])
-        self.metadata = data["VRID"][0]
+        self.record_name = self.standard.record_name(data["VRID"]["RCNM"])
+        self.metadata = data["VRID"].data
         return self
 
     def _build_geometry(self, points, dimensions):
@@ -500,7 +539,7 @@ class S57Geometry(BaseS57Geometry):
         super().__init__(standard, comf, somf)
         self.geometry = []
 
-    def from_iso8211(self, data: iso8211.Record):
+    def from_iso8211(self, data: Record):
         super().from_iso8211(data)
         if "SG3D" in data:
             self.geometry = self._build_geometry(data["SG3D"], 3)
@@ -511,7 +550,7 @@ class S57Geometry(BaseS57Geometry):
                 self.spatial_references.append(self._build_spatial_reference(spatial_pointer))
         return self
 
-    @functools.cached_property
+    @cached_property
     def points(self):
         full_point_list = copy.deepcopy(self.geometry)
         if self.record_name == "VI" or self.record_name == "VC":
@@ -541,7 +580,7 @@ class S57GeometryUpdate(S57Geometry):
         self.spatial_ref_update = None
         self.geometry_update = None
 
-    def from_iso8211(self, data: iso8211.Record):
+    def from_iso8211(self, data: Record):
         super().from_iso8211(data)
         if "SGCC" in data:
             if "SG3D" in data:
